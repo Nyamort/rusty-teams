@@ -4,9 +4,10 @@ use std::pin::Pin;
 use serde_json::json;
 
 use crate::app::{App, find_app_tab, has_login_tab};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::events::{TabControl, TabEvents, open};
 use crate::http::list_targets;
+use crate::scope::Scope;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type OpenedTab = (TabControl, Option<TabEvents>);
@@ -17,7 +18,7 @@ pub struct Diagnosis {
     pub app_tab_open: bool,
 }
 
-/// Where the signed-in Teams web app lives: a debug port or an embedded webview.
+/// A signed-in Teams session backed by a web page or native OAuth.
 pub trait Transport: Send + Sync {
     fn check(&self) -> BoxFuture<'_, Result<()>>;
 
@@ -31,6 +32,20 @@ pub trait Transport: Send + Sync {
 
     /// While held the host must not navigate the app on its own (no parking).
     fn hold(&self, _app: App, _held: bool) {}
+
+    /// Acquire a token for a transport without a web page, renewing sign-in if necessary.
+    fn native_token<'a>(
+        &'a self,
+        _scope: &'a Scope,
+        _tenant: Option<&'a str>,
+        _force_refresh: bool,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async { Err(Error::NativePageRequired) })
+    }
+
+    fn supports_tabs(&self) -> bool {
+        true
+    }
 }
 
 pub struct CdpTransport {

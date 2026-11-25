@@ -17,8 +17,11 @@ const HIDE_POLL: Duration = Duration::from_millis(500);
 const HIDE_STABLE_CHECKS: u32 = 4;
 // MSAL key budget (500 ms) + CDP close (up to 3 s) + profile release (2 s) must fit.
 const STOP_TIMEOUT: Duration = Duration::from_secs(6);
+const CREDENTIAL_READ_ATTEMPTS: usize = 5;
+const NATIVE_REFRESH_TOKEN_FILE: &str = "rusty-teams-native-refresh-token";
 
 static LINUX_BROWSER: OnceLock<browser::Browser> = OnceLock::new();
+static NATIVE_AUTH: OnceLock<Arc<dyn session::Transport>> = OnceLock::new();
 static LIVE_RETRY: OnceLock<Mutex<Option<Arc<Notify>>>> = OnceLock::new();
 static UI_EVENTS: OnceLock<mpsc::UnboundedSender<BackendEvent>> = OnceLock::new();
 static LOGIN_LAUNCH: AtomicU8 = AtomicU8::new(LoginLaunch::Idle as u8);
@@ -79,6 +82,17 @@ pub fn note_backend_event(event: &BackendEvent) {
 /// `force` is the banner action: it may open the window again after the user closed it.
 /// An automatic request opens it once and does not reopen a closed window.
 pub fn request_login_window(force: bool) {
+    if let Some(auth) = NATIVE_AUTH.get() {
+        // Native OAuth owns the sign-in window while acquiring a credential.
+        if force {
+            app_base::runtime::handle().spawn(async move {
+                if auth.check().await.is_ok() {
+                    trigger_live_retry();
+                }
+            });
+        }
+        return;
+    }
     let Some(browser) = LINUX_BROWSER.get().cloned() else {
         return;
     };
@@ -153,27 +167,24 @@ struct HideAfterLogin {
     stable: u32,
 }
 
+fn teams_ready(status: &browser::Status) -> bool {
+    status.running
+        && status.mode == browser::Mode::Visible
+        && status.login_state == browser::LoginState::NotRequired
+        && status
+            .tabs
+            .iter()
+            .any(|tab| tab.app == Some(browser::App::Teams) && !tab.parked)
+}
+
 impl HideAfterLogin {
     fn reset(&mut self) {
         self.stable = 0;
     }
 
     fn step(&mut self, status: Option<&browser::Status>, has_msal_cache: bool) -> bool {
-        let Some(status) = status else {
-            self.stable = 0;
-            return false;
-        };
-        if !status.running || status.mode != browser::Mode::Visible {
+        if !status.is_some_and(teams_ready) || !has_msal_cache {
             self.reset();
-            return false;
-        }
-        let teams_loaded = status.login_state == browser::LoginState::NotRequired
-            && status
-                .tabs
-                .iter()
-                .any(|tab| tab.app == Some(browser::App::Teams) && !tab.parked);
-        if !teams_loaded || !has_msal_cache {
-            self.stable = 0;
             return false;
         }
         self.stable += 1;
@@ -183,15 +194,25 @@ impl HideAfterLogin {
         }
         false
     }
+
+    async fn settled(
+        &mut self,
+        browser: &browser::Browser,
+        status: Option<&browser::Status>,
+    ) -> bool {
+        let has_msal_cache =
+            status.is_some_and(teams_ready) && browser.teams_has_msal_cache().await;
+        self.step(status, has_msal_cache)
+    }
 }
 
-/// Moves a managed visible Chrome window back to headless once Teams sign-in completes, matching WebView2 on Windows.
+/// Moves a managed visible browser back to headless once Teams sign-in completes.
 async fn hide_after_login(browser: browser::Browser, headless_notify: Arc<Notify>) {
     let mut tracker = HideAfterLogin::default();
     loop {
         tokio::time::sleep(HIDE_POLL).await;
         if browser.is_busy() {
-            tracker.stable = 0;
+            tracker.reset();
             continue;
         }
         if !browser.is_visible_managed() {
@@ -199,25 +220,11 @@ async fn hide_after_login(browser: browser::Browser, headless_notify: Arc<Notify
             continue;
         }
         let status = browser.status().await.ok();
-        let has_msal_cache = match status.as_ref() {
-            Some(status)
-                if status.running
-                    && status.mode == browser::Mode::Visible
-                    && status.login_state == browser::LoginState::NotRequired
-                    && status
-                        .tabs
-                        .iter()
-                        .any(|tab| tab.app == Some(browser::App::Teams) && !tab.parked) =>
-            {
-                browser.teams_has_msal_cache().await
-            }
-            _ => false,
-        };
-        if tracker.step(status.as_ref(), has_msal_cache) {
-            log::info!("Teams sign-in finished: moving Chrome to the background");
+        if tracker.settled(&browser, status.as_ref()).await {
+            log::info!("Teams sign-in finished: moving the browser to the background");
             publish_sign_in(BrowserSignInState::Finishing);
             if let Err(error) = browser.headless().await {
-                log::error!("Failed to switch Chrome to headless: {error}");
+                log::error!("Failed to switch the browser to headless: {error}");
                 publish_sign_in(BrowserSignInState::Failed(error.to_string()));
             } else {
                 headless_notify.notify_waiters();
@@ -227,11 +234,102 @@ async fn hide_after_login(browser: browser::Browser, headless_notify: Arc<Notify
     }
 }
 
+async fn wait_for_login(browser: &browser::Browser) -> session::Result<String> {
+    let mut tracker = HideAfterLogin::default();
+    let mut credential_attempts = 0;
+    loop {
+        tokio::time::sleep(HIDE_POLL).await;
+        if browser.is_busy() {
+            tracker.reset();
+            continue;
+        }
+        let status = browser.status().await.ok();
+        if status.as_ref().is_some_and(|status| !status.running) {
+            return Err(session::Error::LoginRequired(
+                "the sign-in window was closed before sign-in finished".into(),
+            ));
+        }
+        if tracker.settled(browser, status.as_ref()).await {
+            match browser
+                .teams_refresh_token(session::TEAMS_WEB_CLIENT_ID)
+                .await
+            {
+                Ok(credential) => return Ok(credential),
+                Err(error) => {
+                    credential_attempts += 1;
+                    if credential_attempts >= CREDENTIAL_READ_ATTEMPTS {
+                        return Err(session::Error::NativeAuth(format!(
+                            "could not import the signed-in Teams credential: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn read_browser_credential() -> session::Result<String> {
+    let browser = match LINUX_BROWSER.get() {
+        Some(browser) => browser.clone(),
+        None => {
+            let browser = browser::Browser::detect().map_err(|error| {
+                session::Error::NativeAuth(format!("could not locate a sign-in browser: {error}"))
+            })?;
+            let _ = LINUX_BROWSER.set(browser.clone());
+            browser
+        }
+    };
+    publish_sign_in(BrowserSignInState::Opening);
+    if let Err(error) = browser.login_window().await {
+        let _ = browser.stop().await;
+        return Err(session::Error::NativeAuth(format!(
+            "could not open the sign-in browser: {error}"
+        )));
+    }
+    publish_sign_in(BrowserSignInState::AwaitingSignIn);
+    let credential = wait_for_login(&browser).await;
+    if credential.is_ok() {
+        publish_sign_in(BrowserSignInState::Finishing);
+    }
+    let stopped = browser.stop().await;
+    let credential = credential?;
+    stopped.map_err(|error| {
+        session::Error::NativeAuth(format!(
+            "sign-in finished, but the browser could not be closed: {error}"
+        ))
+    })?;
+    Ok(credential)
+}
+
+async fn interactive_sign_in() -> session::Result<String> {
+    let result = read_browser_credential().await;
+    let state = match &result {
+        Ok(_) | Err(session::Error::LoginRequired(_)) => BrowserSignInState::Idle,
+        Err(error) => BrowserSignInState::Failed(error.to_string()),
+    };
+    publish_sign_in(state);
+    result
+}
+
+/// Starts strict native authentication. Browser discovery and launch happen only when the saved
+/// refresh credential needs an interactive renewal.
+pub fn start_native() -> Arc<dyn session::Transport> {
+    NATIVE_AUTH
+        .get_or_init(|| {
+            let refresh_token_file = directories::BaseDirs::new()
+                .map(|base| base.data_dir().join(NATIVE_REFRESH_TOKEN_FILE));
+            Arc::new(session::NativeAuth::teams(refresh_token_file, || {
+                Box::pin(interactive_sign_in())
+            }))
+        })
+        .clone()
+}
+
 pub fn start(endpoint: &str) -> Arc<dyn session::Transport> {
     let browser = match browser::Browser::detect() {
         Ok(browser) => browser,
         Err(error) => {
-            log::warn!("Could not detect Chrome/Chromium on system: {error}");
+            log::warn!("Could not detect a supported sign-in browser: {error}");
             publish_sign_in(BrowserSignInState::Failed(error.to_string()));
             return Arc::new(session::CdpTransport::new(endpoint));
         }

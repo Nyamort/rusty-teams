@@ -8,11 +8,11 @@ use futures_util::future::join_all;
 use serde_json::{Value, json};
 
 use crate::app::App;
+use crate::error::Result;
 use crate::request::{ApiResponse, Method, Request};
 use crate::scope::Scope;
 use crate::session::Session;
 
-const TOKEN_BODY: &str = "return token;";
 const CONCURRENCY: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,14 +76,17 @@ impl NativeHttp {
         requests: &[&Request],
         scope: &Scope,
         force_refresh: bool,
-    ) -> Option<Vec<ApiResponse>> {
+    ) -> Result<Option<Vec<ApiResponse>>> {
         if !requests.iter().all(|request| eligible(request)) {
-            return None;
+            return Ok(None);
         }
         let credential = if requests.iter().all(|request| request.anonymous) {
             None
         } else {
-            Some(self.token(session, scope, force_refresh).await?)
+            let Some(token) = self.token(session, scope, force_refresh).await? else {
+                return Ok(None);
+            };
+            Some(token)
         };
         let mut answers = Vec::with_capacity(requests.len());
         for chunk in requests.chunks(CONCURRENCY) {
@@ -93,29 +96,34 @@ impl NativeHttp {
             }
             answers.extend(join_all(pending).await);
         }
-        if answers.iter().any(|answer| answer.status == 401) {
+        if session.transport.supports_tabs() && answers.iter().any(|answer| answer.status == 401) {
             self.forget(scope);
         }
-        Some(answers)
+        Ok(Some(answers))
     }
 
-    async fn token(
+    pub(crate) async fn token(
         &self,
         session: &Session,
         scope: &Scope,
         force_refresh: bool,
-    ) -> Option<(App, String)> {
+    ) -> Result<Option<(App, String)>> {
+        if !session.transport.supports_tabs() {
+            let token = session
+                .access_token(App::Teams, scope, force_refresh)
+                .await?;
+            return Ok(Some((App::Teams, token)));
+        }
         if !force_refresh && let Some(held) = self.held(scope) {
-            return Some(held);
+            return Ok(Some(held));
         }
         for app in App::ALL {
-            let Ok(Value::String(token)) = session
-                .run_with_token(app, scope, TOKEN_BODY, &json!({}), force_refresh)
-                .await
-            else {
+            let Ok(token) = session.access_token(app, scope, force_refresh).await else {
                 continue;
             };
-            let usable_until = usable_until(&token, session.config.refresh_margin)?;
+            let Some(usable_until) = usable_until(&token, session.config.refresh_margin) else {
+                continue;
+            };
             self.tokens.lock().expect("token lock").insert(
                 TokenKey::of(scope),
                 HeldToken {
@@ -124,9 +132,9 @@ impl NativeHttp {
                     usable_until,
                 },
             );
-            return Some((app, token));
+            return Ok(Some((app, token)));
         }
-        None
+        Ok(None)
     }
 
     async fn execute(&self, request: &Request, credential: Option<&(App, String)>) -> ApiResponse {
