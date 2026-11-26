@@ -91,8 +91,15 @@ impl Session {
         config: SessionConfig,
     ) -> Result<Self> {
         transport.check().await?;
+        let browserless = !transport.supports_tabs();
+        let native = native_http(&config, browserless);
+        if browserless && native.is_none() {
+            return Err(Error::NativeAuth(
+                "could not create the native HTTP client".into(),
+            ));
+        }
         Ok(Session {
-            native: native_http(&config),
+            native,
             tenant: None,
             transport,
             config,
@@ -110,7 +117,11 @@ impl Session {
     /// Tokens are held apart from the home tenant's, so both can run side by side.
     pub fn in_tenant(&self, tenant_id: &str) -> Session {
         Session {
-            native: native_http(&self.config),
+            native: if self.transport.supports_tabs() {
+                native_http(&self.config, false)
+            } else {
+                self.native.clone()
+            },
             force_refresh: Arc::new(AtomicBool::new(false)),
             tenant: Some(tenant_id.to_ascii_lowercase().into()),
             ..self.clone()
@@ -167,9 +178,11 @@ impl Session {
                 // A CAE-revoked token stays unexpired in the app cache, so only a refresh-token grant replaces it.
                 self.force_refresh.store(true, Ordering::SeqCst);
                 forced_here = true;
-                self.reload_all().await;
-                sleep(self.config.unauthorized_reload_wait).await;
-                self.drop_all().await;
+                if self.transport.supports_tabs() {
+                    self.reload_all().await;
+                    sleep(self.config.unauthorized_reload_wait).await;
+                    self.drop_all().await;
+                }
             }
             let mut retry = Vec::new();
             for (&index, answer) in pending.iter().zip(answers) {
@@ -229,9 +242,12 @@ impl Session {
                     scope,
                     self.force_refresh.load(Ordering::SeqCst),
                 )
-                .await
+                .await?
         {
             return Ok(results);
+        }
+        if !self.transport.supports_tabs() {
+            return Err(Error::NativePageRequired);
         }
         let mut search = TokenSearch::default();
         if let Some(results) = self.run_in_any_tab(requests, scope, &mut search).await? {
@@ -378,9 +394,8 @@ impl Drop for TabHold {
     }
 }
 
-fn native_http(config: &SessionConfig) -> Option<Arc<NativeHttp>> {
-    config
-        .native_http
+fn native_http(config: &SessionConfig, required: bool) -> Option<Arc<NativeHttp>> {
+    (config.native_http || required)
         .then(|| NativeHttp::new(config.evaluate_timeout, MAX_DOWNLOAD_BYTES))
         .flatten()
         .map(Arc::new)
